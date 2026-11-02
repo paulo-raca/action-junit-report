@@ -1772,6 +1772,7 @@ describe('parseTestReports', () => {
       globalAnnotations: [],
       passed: 0,
       retried: 0,
+      flaky: 0,
       testResults: []
     })
   })
@@ -1844,5 +1845,81 @@ describe('parseTestReports', () => {
     // Both transformers should be applied: "python/test_sample" -> "test_sample" -> "sample"
     expect(filtered[0].title).toBe('sample | test_which_fails')
     expect(filtered[1].title).toBe('sample | test_with_error')
+  })
+})
+
+describe('flaky failure reporting (annotate_flaky)', () => {
+  // parseFile(file, suiteRegex, includePassed, annotateNotice, checkRetries, ...defaults..., resolveIgnoreClassname, annotateFlaky)
+  const parse = (file: string, annotateFlaky: boolean, includePassed = false) =>
+    parseFile(
+      `test_results/flaky_retries/${file}`,
+      '',
+      includePassed,
+      false,
+      true, // checkRetries
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      annotateFlaky
+    )
+
+  it('counts distinct flaky tests separately from retry attempts', async () => {
+    const result = await parse('flaky_with_classname_file.xml', false)
+    expect(result!.retriedCount).toBe(2) // 3 attempts of test_foo - 1
+    expect(result!.flakyCount).toBe(1) // ... but a single flaky test
+    expect(result!.failedCount).toBe(0)
+  })
+
+  it('does not add annotations without annotate_flaky', async () => {
+    const result = await parse('flaky_with_classname_file.xml', false)
+    expect(result!.globalAnnotations).toHaveLength(0)
+  })
+
+  it('reports each failed attempt of a flaky test as a warning with its details', async () => {
+    const result = await parse('flaky_with_classname_file.xml', true)
+    expect(result!.failedCount).toBe(0) // still passes
+    expect(result!.passedCount).toBe(3)
+    expect(result!.flakyCount).toBe(1)
+
+    const warnings = result!.globalAnnotations.filter(a => a.annotation_level === 'warning')
+    expect(warnings).toHaveLength(2)
+    expect(warnings[0].title).toContain('(flaky: failed attempt 1/2)')
+    expect(warnings[0].message).toBe('it failed')
+    expect(warnings[0].raw_details).toContain("'NoneType' object is not iterable")
+    expect(warnings[1].title).toContain('(flaky: failed attempt 2/2)')
+    expect(warnings[1].message).toBe('it broke')
+    expect(warnings[1].raw_details).toContain('oh no')
+    // must not read as a failure
+    expect(warnings.every(a => a.status === 'success')).toBe(true)
+
+    // the flaky test itself is reported (notice) with its retries, which feeds the flaky summary
+    const notices = result!.globalAnnotations.filter(a => a.annotation_level === 'notice')
+    expect(notices).toHaveLength(1)
+    expect(notices[0].retries).toBe(2)
+    expect(notices[0].status).toBe('success')
+  })
+
+  it('reports failures that came after a first success', async () => {
+    const result = await parse('flaky_success_first.xml', true)
+    expect(result!.failedCount).toBe(0)
+    expect(result!.flakyCount).toBe(1)
+    const warnings = result!.globalAnnotations.filter(a => a.annotation_level === 'warning')
+    expect(warnings.map(a => a.message)).toEqual(['later failure', 'later error'])
+  })
+
+  it('does not call a test that failed every attempt flaky', async () => {
+    const result = await parse('flaky_all_failures.xml', true)
+    expect(result!.flakyCount).toBe(0)
+    expect(result!.failedCount).toBe(1)
+    expect(result!.globalAnnotations.filter(a => a.annotation_level === 'warning')).toHaveLength(0)
+    expect(result!.globalAnnotations.filter(a => a.status === 'failure')).toHaveLength(1)
   })
 })

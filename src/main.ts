@@ -62,6 +62,7 @@ export async function run(): Promise<void> {
     const skipAnnotations = core.getInput('skip_annotations') === 'true'
     const truncateStackTraces = core.getBooleanInput('truncate_stack_traces')
     const resolveIgnoreClassname = core.getBooleanInput('resolve_ignore_classname')
+    const annotateFlaky = core.getBooleanInput('annotate_flaky')
 
     if (excludeSources.length === 0) {
       excludeSources = ['/build/', '/__pycache__/']
@@ -81,6 +82,7 @@ export async function run(): Promise<void> {
       failed: 0,
       passed: 0,
       retried: 0,
+      flaky: 0,
       time: 0,
       foundFiles: 0,
       globalAnnotations: [],
@@ -107,13 +109,15 @@ export async function run(): Promise<void> {
         annotationsLimit,
         truncateStackTraces,
         failOnParseError,
-        resolveIgnoreClassname
+        resolveIgnoreClassname,
+        annotateFlaky
       )
       mergedResult.totalCount += testResult.totalCount
       mergedResult.skipped += testResult.skipped
       mergedResult.failed += testResult.failed
       mergedResult.passed += testResult.passed
       mergedResult.retried += testResult.retried
+      mergedResult.flaky += testResult.flaky
       mergedResult.time += testResult.time
 
       if (groupReports) {
@@ -128,6 +132,7 @@ export async function run(): Promise<void> {
             failed: actualTestResult.failedCount,
             passed: actualTestResult.passedCount,
             retried: actualTestResult.retriedCount,
+            flaky: actualTestResult.flakyCount,
             time: actualTestResult.time,
             foundFiles: 1,
             globalAnnotations: actualTestResult.annotations,
@@ -142,6 +147,7 @@ export async function run(): Promise<void> {
     core.setOutput('skipped', mergedResult.skipped)
     core.setOutput('failed', mergedResult.failed)
     core.setOutput('retried', mergedResult.retried)
+    core.setOutput('flaky', mergedResult.flaky)
     core.setOutput('time', mergedResult.time)
 
     if (!(mergedResult.totalCount > 0 || mergedResult.skipped > 0) && requireTests) {

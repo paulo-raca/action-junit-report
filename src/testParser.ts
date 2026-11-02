@@ -12,6 +12,7 @@ export interface ActualTestResult {
   failedCount: number
   passedCount: number
   retriedCount: number
+  flakyCount: number
   time: number
   annotations: Annotation[]
   globalAnnotations: Annotation[]
@@ -24,6 +25,7 @@ interface TestCasesResult {
   failedCount: number
   passedCount: number
   retriedCount: number
+  flakyCount: number
   time: number
   annotations: Annotation[]
 }
@@ -46,6 +48,7 @@ export interface TestResult {
   failed: number
   passed: number
   retried: number
+  flaky: number
   time: number
   foundFiles: number
   globalAnnotations: Annotation[]
@@ -219,7 +222,8 @@ export async function parseFile(
   truncateStackTraces = true,
   failOnParseError = false,
   globalAnnotations: Annotation[] = [],
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  annotateFlaky = false
 ): Promise<ActualTestResult | undefined> {
   core.debug(`Parsing file ${file}`)
 
@@ -259,7 +263,8 @@ export async function parseFile(
     annotationsLimit,
     truncateStackTraces,
     globalAnnotations,
-    resolveIgnoreClassname
+    resolveIgnoreClassname,
+    annotateFlaky
   )
 
   if (testResult !== undefined && !testResult.name) {
@@ -290,7 +295,8 @@ async function parseSuite(
   annotationsLimit: number,
   truncateStackTraces: boolean,
   globalAnnotations: Annotation[],
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  annotateFlaky = false
 ): Promise<ActualTestResult | undefined> {
   if (!suite) {
     // not a valid suite, return fast
@@ -307,6 +313,7 @@ async function parseSuite(
   let failedCount = 0
   let passedCount = 0
   let retriedCount = 0
+  let flakyCount = 0
   let time = 0
   const annotations: Annotation[] = []
 
@@ -332,7 +339,8 @@ async function parseSuite(
       followSymlink,
       truncateStackTraces,
       limit,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      annotateFlaky
     )
 
     // expand global annotations array
@@ -341,6 +349,7 @@ async function parseSuite(
     failedCount += parsedTestCases.failedCount
     passedCount += parsedTestCases.passedCount
     retriedCount += parsedTestCases.retriedCount
+    flakyCount += parsedTestCases.flakyCount
     time += parsedTestCases.time
     annotations.push(...parsedTestCases.annotations)
     globalAnnotations.push(...parsedTestCases.annotations)
@@ -354,6 +363,7 @@ async function parseSuite(
       failedCount,
       passedCount,
       retriedCount,
+      flakyCount,
       time,
       annotations,
       globalAnnotations,
@@ -389,7 +399,8 @@ async function parseSuite(
       annotationsLimit,
       truncateStackTraces,
       globalAnnotations,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      annotateFlaky
     )
 
     if (childSuiteResult) {
@@ -399,6 +410,7 @@ async function parseSuite(
       failedCount += childSuiteResult.failedCount
       passedCount += childSuiteResult.passedCount
       retriedCount += childSuiteResult.retriedCount
+      flakyCount += childSuiteResult.flakyCount
       time += childSuiteResult.time
     }
 
@@ -411,6 +423,7 @@ async function parseSuite(
         failedCount,
         passedCount,
         retriedCount,
+        flakyCount,
         time,
         annotations,
         globalAnnotations,
@@ -426,6 +439,7 @@ async function parseSuite(
     failedCount,
     passedCount,
     retriedCount,
+    flakyCount,
     time,
     annotations,
     globalAnnotations,
@@ -577,7 +591,8 @@ async function parseTestCases(
   followSymlink: boolean,
   truncateStackTraces: boolean,
   limit = -1,
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  annotateFlaky = false
 ): Promise<TestCasesResult> {
   const toIssueArray = (value: any): TestCaseIssue[] => {
     if (!value) return []
@@ -588,17 +603,23 @@ async function parseTestCases(
   let totalCount = 0
   let skippedCount = 0
   let retriedCount = 0
+  let flakyCount = 0
   let time = 0
   if (checkRetries) {
     // identify duplicates in case of flaky tests, and remove them
     // Use a compound key including name, classname (if available), and file (if available)
     // to prevent accidental duplicate matches across different test classes/files
     const testcaseMap = new Map<string, any>()
+    const failedAttemptsByKey = new Map<string, any[]>()
     for (const testcase of testcases) {
       const name = testcase._attributes.name
       const classname = testcase._attributes.classname || ''
       const file = testcase._attributes.file || ''
       const key = `${name}|${classname}|${file}`
+
+      if (testcase.failure || testcase.error) {
+        failedAttemptsByKey.set(key, [...(failedAttemptsByKey.get(key) || []), testcase])
+      }
 
       if (testcaseMap.get(key) !== undefined) {
         // testcase with matching key exists - this is a flaky test
@@ -631,7 +652,20 @@ async function parseTestCases(
         testcaseMap.set(key, testcase)
       }
     }
+    // A test that ended up passing keeps the failures of its earlier attempts, so they can be reported.
+    for (const [key, testcase] of testcaseMap) {
+      if (annotateFlaky && (testcase.retries || 0) > 0 && !testcase.failure && !testcase.error) {
+        testcase.failedAttempts = failedAttemptsByKey.get(key) || []
+      }
+    }
     testcases = Array.from(testcaseMap.values())
+    // Distinct flaky tests: retried at least once and the kept (final) result is not a failure or a skip.
+    // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
+    for (const testcase of testcases) {
+      if ((testcase.retries || 0) > 0 && !testcase.failure && !testcase.error && !testcase.skipped) {
+        flakyCount++
+      }
+    }
   }
 
   let testCaseFailedCount = 0 // Track number of test cases that failed
@@ -669,10 +703,47 @@ async function parseTestCases(
         : 1
       : 0
 
+    // A flaky test (failed, then passed on retry): report each failed attempt as a warning with its failure
+    // details, so the report shows what failed even though the test counts as passed.
+    const flakyAttempts: any[] = !testFailure && !skip ? testcase.failedAttempts || [] : []
+    for (let attemptIndex = 0; attemptIndex < flakyAttempts.length; attemptIndex++) {
+      const attempt = flakyAttempts[attemptIndex]
+      const attemptIssues = [...toIssueArray(attempt.failure), ...toIssueArray(attempt.error)]
+      const attemptAnnotation = await createTestCaseAnnotation(
+        attempt,
+        attemptIssues[0] ?? null,
+        0,
+        1,
+        suiteName,
+        suiteFile,
+        suiteLine,
+        breadCrumb,
+        attempt._attributes.time === undefined ? 0 : parseFloat(attempt._attributes.time),
+        false,
+        false,
+        'warning',
+        0,
+        annotateNotice,
+        true,
+        excludeSources,
+        checkTitleTemplate,
+        testFilesPrefix,
+        transformer,
+        followSymlink,
+        truncateStackTraces,
+        resolveIgnoreClassname
+      )
+      attemptAnnotation.title = `${attemptAnnotation.title} (flaky: failed attempt ${attemptIndex + 1}/${flakyAttempts.length})`
+      attemptAnnotation.status = 'success' // the test passed in the end, this must not count as a failure
+      attemptAnnotation.retries = 0
+      annotations.push(attemptAnnotation)
+    }
+    const isFlaky = annotateFlaky && !testFailure && !skip && (testcase.retries || 0) > 0
+
     // If this isn't reported as a failure and processing all passed tests
     // isn't enabled, then skip the rest of the processing.
     // Exception: if the test has flaky failures, always process it to track retries
-    if (annotationLevel !== 'failure' && !includePassed && flakyFailuresCount === 0) {
+    if (annotationLevel !== 'failure' && !includePassed && flakyFailuresCount === 0 && !isFlaky) {
       continue
     }
 
@@ -724,6 +795,7 @@ async function parseTestCases(
     failedCount,
     passedCount,
     retriedCount,
+    flakyCount,
     time,
     annotations
   }
@@ -753,7 +825,8 @@ export async function parseTestReports(
   annotationsLimit = -1,
   truncateStackTraces = true,
   failOnParseError = false,
-  resolveIgnoreClassname = false
+  resolveIgnoreClassname = false,
+  annotateFlaky = false
 ): Promise<TestResult> {
   core.debug(`Process test report for: ${reportPaths} (${checkName})`)
   const files = await glob(reportPaths, {follow: followSymlink})
@@ -764,6 +837,7 @@ export async function parseTestReports(
   let failed = 0
   let passed = 0
   let retried = 0
+  let flaky = 0
   let time = 0
   let foundFiles = 0
   for (const file of files) {
@@ -786,16 +860,26 @@ export async function parseTestReports(
       truncateStackTraces,
       failOnParseError,
       globalAnnotations,
-      resolveIgnoreClassname
+      resolveIgnoreClassname,
+      annotateFlaky
     )
 
     if (!testResult) continue
-    const {totalCount: c, skippedCount: s, failedCount: f, passedCount: p, retriedCount: r, time: t} = testResult
+    const {
+      totalCount: c,
+      skippedCount: s,
+      failedCount: f,
+      passedCount: p,
+      retriedCount: r,
+      flakyCount: fl,
+      time: t
+    } = testResult
     totalCount += c
     skipped += s
     failed += f
     passed += p
     retried += r
+    flaky += fl
     time += t
     testResults.push(testResult)
 
@@ -812,6 +896,7 @@ export async function parseTestReports(
     failed,
     passed,
     retried,
+    flaky,
     time,
     foundFiles,
     globalAnnotations,

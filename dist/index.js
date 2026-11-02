@@ -11844,6 +11844,12 @@ const kRefusedStreamRetry = Symbol('refused stream retry')
 // event loop.
 const MAX_GOAWAY_REPLAY_ATTEMPTS = 1
 
+// Lower bound on how long a liveness PING may take to be acked. Stream
+// timeouts can be tiny (tens of ms), while an ack on a live connection can take
+// longer than that on a loaded event loop; without a floor a slow but healthy
+// connection would be torn down.
+const MIN_PROBE_TIMEOUT = 1e3
+
 let extractBody
 
 /** @type {import('http2')} */
@@ -12060,6 +12066,9 @@ function connectH2 (client, socket) {
     // Armed while the peer advertises MAX_CONCURRENT_STREAMS = 0 and we have
     // work that cannot start. See setNoStreamsTimeout.
     noStreamsTimeout: null,
+    // Armed while a PING checks whether the peer is still there after a
+    // stream timed out. See probeHttp2Session.
+    probeTimeout: null,
     // Sockets start out ref'd. Session ref/unref proxies to the socket, so a
     // single cached flag lets us skip redundant uv ref/unref calls, provided
     // every ref/unref of the session or its socket goes through
@@ -12141,6 +12150,11 @@ function connectH2 (client, socket) {
     */
     busy (request) {
       if (session[kRemoteSettings] === false && client[kRunning] > 0) {
+        return true
+      }
+
+      // Do not open streams on a connection that may be dead.
+      if (session[kHTTP2SessionState].probeTimeout != null) {
         return true
       }
 
@@ -12273,6 +12287,60 @@ function onNoStreamsTimeout (session) {
 
   // Drop the unusable session so the next request gets a fresh connection,
   // whose SETTINGS may well allow streams again.
+  session[kError] = err
+  resetHttp2Session(session, err)
+}
+
+// A stream timeout only resets that stream, unlike HTTP/1.1 which destroys the
+// socket. If the connection itself silently died (dropped by a NAT or load
+// balancer, a hung peer), every new stream would time out in turn and the
+// session would never be replaced. Ask the peer for a PING ack within the
+// timeout that just fired (but at least MIN_PROBE_TIMEOUT): if it answers, only
+// that request was slow; if not, drop the session so queued requests move to a
+// fresh connection.
+function probeHttp2Session (session, timeout) {
+  const state = session[kHTTP2SessionState]
+
+  if (state.probeTimeout != null || session.closed || session.destroyed) {
+    return
+  }
+
+  try {
+    session.ping(onHttp2ProbeAck.bind(session))
+  } catch {
+    // The session is going away on its own.
+    return
+  }
+
+  state.probeTimeout = setTimeout(onHttp2ProbeTimeout, Math.max(timeout, MIN_PROBE_TIMEOUT), session).unref()
+}
+
+function clearHttp2ProbeTimeout (session) {
+  const state = session[kHTTP2SessionState]
+
+  if (state?.probeTimeout != null) {
+    clearTimeout(state.probeTimeout)
+    state.probeTimeout = null
+  }
+}
+
+function onHttp2ProbeAck () {
+  if (this[kHTTP2SessionState].probeTimeout == null) {
+    return
+  }
+
+  clearHttp2ProbeTimeout(this)
+  this[kClient][kResume]()
+}
+
+function onHttp2ProbeTimeout (session) {
+  session[kHTTP2SessionState].probeTimeout = null
+
+  if (session.closed || session.destroyed) {
+    return
+  }
+
+  const err = new SocketError('HTTP/2: connection unresponsive', util.getSocketInfo(session[kSocket]))
   session[kError] = err
   resetHttp2Session(session, err)
 }
@@ -12469,6 +12537,7 @@ function onHttp2SessionGoAway (errorCode, lastStreamID) {
 
   clearHttp2IdleTimeout(this)
   clearNoStreamsTimeout(this)
+  clearHttp2ProbeTimeout(this)
 
   if (!this.closed && !this.destroyed) {
     this.close()
@@ -12494,6 +12563,7 @@ function onHttp2SessionClose () {
 
   clearHttp2IdleTimeout(this)
   clearNoStreamsTimeout(this)
+  clearHttp2ProbeTimeout(this)
 
   if (state.ping.interval != null) {
     clearInterval(state.ping.interval)
@@ -13393,9 +13463,14 @@ function onTimeout () {
   // Remove self so timeout doesn't fire again after we handle it
   stream.off('timeout', onTimeout)
 
-  const err = state.responseReceived
-    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`)
-    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`)
+  const { responseReceived, session, bodyTimeout, headersTimeout } = state
+  const err = responseReceived
+    ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${bodyTimeout}"`)
+    : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${headersTimeout}"`)
+
+  // Probe before aborting: completing the request resumes the queue, which
+  // must not open new streams until the peer has proven it is alive.
+  probeHttp2Session(session, responseReceived ? bodyTimeout : headersTimeout)
   state.abort(err)
 }
 
@@ -16275,6 +16350,7 @@ module.exports = { H1Parser, getMiloEnabled, setMiloEnabled }
 
 
 
+const { AsyncResource } = __nccwpck_require__(6698)
 const { PoolStats } = __nccwpck_require__(6854)
 const DispatcherBase = __nccwpck_require__(1841)
 const FixedQueue = __nccwpck_require__(4660)
@@ -16301,6 +16377,22 @@ const kRetiring = Symbol('retiring clients')
 // Closes every live client, including clients that have been
 // taken out of rotation but are still finishing their own
 // requests.
+// Requests that wait in the Pool queue are dispatched later from whichever
+// callback drains the queue (another request's connect, drain, ...). Capture
+// the caller's async context so Client#dispatch, and the diagnostics channel
+// events it publishes, still run in it.
+class QueuedRequest extends AsyncResource {
+  constructor (opts, handler) {
+    super('UNDICI_POOL_QUEUED_REQUEST')
+    this.opts = opts
+    this.handler = handler
+  }
+
+  dispatch (dispatcher) {
+    return this.runInAsyncScope(dispatcher.dispatch, dispatcher, this.opts, this.handler)
+  }
+}
+
 function closeClients (pool) {
   const closeAll = []
   for (let i = 0; i < pool[kClients].length; i++) {
@@ -16344,7 +16436,7 @@ class PoolBase extends DispatcherBase {
         break
       }
       this[kQueued]--
-      needDrain = !client.dispatch(item.opts, item.handler)
+      needDrain = !item.dispatch(client)
     }
 
     client[kNeedDrain] = needDrain
@@ -16389,7 +16481,7 @@ class PoolBase extends DispatcherBase {
       const item = queue.shift()
       this[kQueued]--
 
-      if (!dispatcher.dispatch(item.opts, item.handler)) {
+      if (!item.dispatch(dispatcher)) {
         dispatcher[kNeedDrain] = true
         this[kOnClientBusy](dispatcher)
         hasDispatcher = this[kHasDispatcher]()
@@ -16503,7 +16595,7 @@ class PoolBase extends DispatcherBase {
 
     if (!dispatcher) {
       this[kNeedDrain] = true
-      this[kQueue].push({ opts, handler })
+      this[kQueue].push(new QueuedRequest(opts, handler))
       this[kQueued]++
     } else if (!dispatcher.dispatch(opts, handler)) {
       dispatcher[kNeedDrain] = true
@@ -56948,7 +57040,8 @@ async function annotateTestResult(testResult, token, headSha, checkAnnotations, 
     const foundResults = testResult.totalCount > 0 || testResult.skipped > 0;
     let title = 'No test results found!';
     if (foundResults) {
-        title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed.`;
+        const flakyTitle = testResult.flaky > 0 ? `, ${testResult.flaky} flaky` : '';
+        title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed${flakyTitle}.`;
     }
     info(`ℹ️ - ${testResult.checkName} - ${title}`);
     const conclusion = testResult.failed <= 0 ? 'success' : 'failure';
@@ -64186,7 +64279,7 @@ async function resolvePath(workspace, transformedFileName, excludeSources, follo
  * https://github.com/mikepenz/action-junit-report/
  */
 async function parseFile(file, suiteRegex = '', // no-op
-includePassed = false, annotateNotice = false, checkRetries = false, excludeSources = ['/build/', '/__pycache__/', '/node_modules/'], checkTitleTemplate = undefined, breadCrumbDelimiter = '/', testFilesPrefix = '', transformer = [], followSymlink = false, annotationsLimit = -1, truncateStackTraces = true, failOnParseError = false, globalAnnotations = [], resolveIgnoreClassname = false) {
+includePassed = false, annotateNotice = false, checkRetries = false, excludeSources = ['/build/', '/__pycache__/', '/node_modules/'], checkTitleTemplate = undefined, breadCrumbDelimiter = '/', testFilesPrefix = '', transformer = [], followSymlink = false, annotationsLimit = -1, truncateStackTraces = true, failOnParseError = false, globalAnnotations = [], resolveIgnoreClassname = false, annotateFlaky = false) {
     core_debug(`Parsing file ${file}`);
     const data = external_fs_namespaceObject.readFileSync(file, 'utf8');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -64207,7 +64300,7 @@ includePassed = false, annotateNotice = false, checkRetries = false, excludeSour
         return undefined;
     }
     const testResult = await parseSuite(testsuite, suiteRegex, // no-op
-    '', breadCrumbDelimiter, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname);
+    '', breadCrumbDelimiter, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname, annotateFlaky);
     if (testResult !== undefined && !testResult.name) {
         testResult.name = external_path_namespaceObject.basename(file);
     }
@@ -64219,7 +64312,7 @@ function templateVar(varName) {
 async function parseSuite(
 /* eslint-disable  @typescript-eslint/no-explicit-any */
 suite, suiteRegex, // no-op
-breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, testFilesPrefix = '', transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname = false) {
+breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, testFilesPrefix = '', transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname = false, annotateFlaky = false) {
     if (!suite) {
         // not a valid suite, return fast
         return undefined;
@@ -64233,6 +64326,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
     let failedCount = 0;
     let passedCount = 0;
     let retriedCount = 0;
+    let flakyCount = 0;
     let time = 0;
     const annotations = [];
     // parse testCases
@@ -64241,13 +64335,14 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
         const suiteFile = suite._attributes !== undefined ? suite._attributes.file : null;
         const suiteLine = suite._attributes !== undefined ? suite._attributes.line : null;
         const limit = annotationsLimit >= 0 ? annotationsLimit - globalAnnotations.length : annotationsLimit;
-        const parsedTestCases = await parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testcases, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, truncateStackTraces, limit, resolveIgnoreClassname);
+        const parsedTestCases = await parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testcases, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, truncateStackTraces, limit, resolveIgnoreClassname, annotateFlaky);
         // expand global annotations array
         totalCount += parsedTestCases.totalCount;
         skippedCount += parsedTestCases.skippedCount;
         failedCount += parsedTestCases.failedCount;
         passedCount += parsedTestCases.passedCount;
         retriedCount += parsedTestCases.retriedCount;
+        flakyCount += parsedTestCases.flakyCount;
         time += parsedTestCases.time;
         annotations.push(...parsedTestCases.annotations);
         globalAnnotations.push(...parsedTestCases.annotations);
@@ -64261,6 +64356,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
             failedCount,
             passedCount,
             retriedCount,
+            flakyCount,
             time,
             annotations,
             globalAnnotations,
@@ -64278,7 +64374,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
     const childSuiteResults = [];
     const childBreadCrumb = suiteName ? `${breadCrumb}${suiteName}${breadCrumbDelimiter}` : breadCrumb;
     for (const childSuite of childTestSuites) {
-        const childSuiteResult = await parseSuite(childSuite, suiteRegex, childBreadCrumb, breadCrumbDelimiter, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname);
+        const childSuiteResult = await parseSuite(childSuite, suiteRegex, childBreadCrumb, breadCrumbDelimiter, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, globalAnnotations, resolveIgnoreClassname, annotateFlaky);
         if (childSuiteResult) {
             childSuiteResults.push(childSuiteResult);
             totalCount += childSuiteResult.totalCount;
@@ -64286,6 +64382,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
             failedCount += childSuiteResult.failedCount;
             passedCount += childSuiteResult.passedCount;
             retriedCount += childSuiteResult.retriedCount;
+            flakyCount += childSuiteResult.flakyCount;
             time += childSuiteResult.time;
         }
         // skip out if we reached our annotations limit
@@ -64297,6 +64394,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
                 failedCount,
                 passedCount,
                 retriedCount,
+                flakyCount,
                 time,
                 annotations,
                 globalAnnotations,
@@ -64311,6 +64409,7 @@ breadCrumb, breadCrumbDelimiter = '/', includePassed = false, annotateNotice = f
         failedCount,
         passedCount,
         retriedCount,
+        flakyCount,
         time,
         annotations,
         globalAnnotations,
@@ -64407,7 +64506,7 @@ async function createTestCaseAnnotation(testcase, issue, failureIndex, totalFail
         time: testTime
     };
 }
-async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testcases, includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, testFilesPrefix = '', transformer, followSymlink, truncateStackTraces, limit = -1, resolveIgnoreClassname = false) {
+async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testcases, includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, testFilesPrefix = '', transformer, followSymlink, truncateStackTraces, limit = -1, resolveIgnoreClassname = false, annotateFlaky = false) {
     const toIssueArray = (value) => {
         if (!value)
             return [];
@@ -64417,17 +64516,22 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
     let totalCount = 0;
     let skippedCount = 0;
     let retriedCount = 0;
+    let flakyCount = 0;
     let time = 0;
     if (checkRetries) {
         // identify duplicates in case of flaky tests, and remove them
         // Use a compound key including name, classname (if available), and file (if available)
         // to prevent accidental duplicate matches across different test classes/files
         const testcaseMap = new Map();
+        const failedAttemptsByKey = new Map();
         for (const testcase of testcases) {
             const name = testcase._attributes.name;
             const classname = testcase._attributes.classname || '';
             const file = testcase._attributes.file || '';
             const key = `${name}|${classname}|${file}`;
+            if (testcase.failure || testcase.error) {
+                failedAttemptsByKey.set(key, [...(failedAttemptsByKey.get(key) || []), testcase]);
+            }
             if (testcaseMap.get(key) !== undefined) {
                 // testcase with matching key exists - this is a flaky test
                 const failed = testcase.failure || testcase.error;
@@ -64460,7 +64564,20 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
                 testcaseMap.set(key, testcase);
             }
         }
+        // A test that ended up passing keeps the failures of its earlier attempts, so they can be reported.
+        for (const [key, testcase] of testcaseMap) {
+            if (annotateFlaky && (testcase.retries || 0) > 0 && !testcase.failure && !testcase.error) {
+                testcase.failedAttempts = failedAttemptsByKey.get(key) || [];
+            }
+        }
         testcases = Array.from(testcaseMap.values());
+        // Distinct flaky tests: retried at least once and the kept (final) result is not a failure or a skip.
+        // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
+        for (const testcase of testcases) {
+            if ((testcase.retries || 0) > 0 && !testcase.failure && !testcase.error && !testcase.skipped) {
+                flakyCount++;
+            }
+        }
     }
     let testCaseFailedCount = 0; // Track number of test cases that failed
     for (const testcase of testcases) {
@@ -64489,10 +64606,23 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
                 ? testcase.flakyFailure.length
                 : 1
             : 0;
+        // A flaky test (failed, then passed on retry): report each failed attempt as a warning with its failure
+        // details, so the report shows what failed even though the test counts as passed.
+        const flakyAttempts = !testFailure && !skip ? testcase.failedAttempts || [] : [];
+        for (let attemptIndex = 0; attemptIndex < flakyAttempts.length; attemptIndex++) {
+            const attempt = flakyAttempts[attemptIndex];
+            const attemptIssues = [...toIssueArray(attempt.failure), ...toIssueArray(attempt.error)];
+            const attemptAnnotation = await createTestCaseAnnotation(attempt, attemptIssues[0] ?? null, 0, 1, suiteName, suiteFile, suiteLine, breadCrumb, attempt._attributes.time === undefined ? 0 : parseFloat(attempt._attributes.time), false, false, 'warning', 0, annotateNotice, true, excludeSources, checkTitleTemplate, testFilesPrefix, transformer, followSymlink, truncateStackTraces, resolveIgnoreClassname);
+            attemptAnnotation.title = `${attemptAnnotation.title} (flaky: failed attempt ${attemptIndex + 1}/${flakyAttempts.length})`;
+            attemptAnnotation.status = 'success'; // the test passed in the end, this must not count as a failure
+            attemptAnnotation.retries = 0;
+            annotations.push(attemptAnnotation);
+        }
+        const isFlaky = annotateFlaky && !testFailure && !skip && (testcase.retries || 0) > 0;
         // If this isn't reported as a failure and processing all passed tests
         // isn't enabled, then skip the rest of the processing.
         // Exception: if the test has flaky failures, always process it to track retries
-        if (annotationLevel !== 'failure' && !includePassed && flakyFailuresCount === 0) {
+        if (annotationLevel !== 'failure' && !includePassed && flakyFailuresCount === 0 && !isFlaky) {
             continue;
         }
         // Handle multiple failures/errors or single case (success/skip).
@@ -64516,6 +64646,7 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
         failedCount,
         passedCount,
         retriedCount,
+        flakyCount,
         time,
         annotations
     };
@@ -64528,7 +64659,7 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
  * https://github.com/mikepenz/action-junit-report/
  */
 async function parseTestReports(checkName, summary, reportPaths, suiteRegex, // no-op
-includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, breadCrumbDelimiter, testFilesPrefix = '', transformer = [], followSymlink = false, annotationsLimit = -1, truncateStackTraces = true, failOnParseError = false, resolveIgnoreClassname = false) {
+includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, breadCrumbDelimiter, testFilesPrefix = '', transformer = [], followSymlink = false, annotationsLimit = -1, truncateStackTraces = true, failOnParseError = false, resolveIgnoreClassname = false, annotateFlaky = false) {
     core_debug(`Process test report for: ${reportPaths} (${checkName})`);
     const files = await glob(reportPaths, { follow: followSymlink });
     const globalAnnotations = [];
@@ -64538,20 +64669,22 @@ includePassed = false, annotateNotice = false, checkRetries = false, excludeSour
     let failed = 0;
     let passed = 0;
     let retried = 0;
+    let flaky = 0;
     let time = 0;
     let foundFiles = 0;
     for (const file of files) {
         foundFiles++;
         core_debug(`Parsing report file: ${file}`);
-        const testResult = await parseFile(file, suiteRegex, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, breadCrumbDelimiter, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, failOnParseError, globalAnnotations, resolveIgnoreClassname);
+        const testResult = await parseFile(file, suiteRegex, includePassed, annotateNotice, checkRetries, excludeSources, checkTitleTemplate, breadCrumbDelimiter, testFilesPrefix, transformer, followSymlink, annotationsLimit, truncateStackTraces, failOnParseError, globalAnnotations, resolveIgnoreClassname, annotateFlaky);
         if (!testResult)
             continue;
-        const { totalCount: c, skippedCount: s, failedCount: f, passedCount: p, retriedCount: r, time: t } = testResult;
+        const { totalCount: c, skippedCount: s, failedCount: f, passedCount: p, retriedCount: r, flakyCount: fl, time: t } = testResult;
         totalCount += c;
         skipped += s;
         failed += f;
         passed += p;
         retried += r;
+        flaky += fl;
         time += t;
         testResults.push(testResult);
         if (annotationsLimit > 0 && globalAnnotations.length >= annotationsLimit) {
@@ -64566,6 +64699,7 @@ includePassed = false, annotateNotice = false, checkRetries = false, excludeSour
         failed,
         passed,
         retried,
+        flaky,
         time,
         foundFiles,
         globalAnnotations,
@@ -64942,6 +65076,7 @@ async function run() {
         const skipAnnotations = getInput('skip_annotations') === 'true';
         const truncateStackTraces = getBooleanInput('truncate_stack_traces');
         const resolveIgnoreClassname = getBooleanInput('resolve_ignore_classname');
+        const annotateFlaky = getBooleanInput('annotate_flaky');
         if (excludeSources.length === 0) {
             excludeSources = ['/build/', '/__pycache__/'];
         }
@@ -64957,6 +65092,7 @@ async function run() {
             failed: 0,
             passed: 0,
             retried: 0,
+            flaky: 0,
             time: 0,
             foundFiles: 0,
             globalAnnotations: [],
@@ -64964,12 +65100,13 @@ async function run() {
         };
         info(`Preparing ${reportsCount} report as configured.`);
         for (let i = 0; i < reportsCount; i++) {
-            const testResult = await parseTestReports(retrieve('checkName', checkName, i, reportsCount), retrieve('summary', summary, i, reportsCount), retrieve('reportPaths', reportPaths, i, reportsCount), retrieve('suiteRegex', suiteRegex, i, reportsCount), includePassed, annotateNotice, checkRetries, excludeSources, retrieve('checkTitleTemplate', checkTitleTemplate, i, reportsCount), breadCrumbDelimiter, retrieve('testFilesPrefix', testFilesPrefix, i, reportsCount), transformers, followSymlink, annotationsLimit, truncateStackTraces, failOnParseError, resolveIgnoreClassname);
+            const testResult = await parseTestReports(retrieve('checkName', checkName, i, reportsCount), retrieve('summary', summary, i, reportsCount), retrieve('reportPaths', reportPaths, i, reportsCount), retrieve('suiteRegex', suiteRegex, i, reportsCount), includePassed, annotateNotice, checkRetries, excludeSources, retrieve('checkTitleTemplate', checkTitleTemplate, i, reportsCount), breadCrumbDelimiter, retrieve('testFilesPrefix', testFilesPrefix, i, reportsCount), transformers, followSymlink, annotationsLimit, truncateStackTraces, failOnParseError, resolveIgnoreClassname, annotateFlaky);
             mergedResult.totalCount += testResult.totalCount;
             mergedResult.skipped += testResult.skipped;
             mergedResult.failed += testResult.failed;
             mergedResult.passed += testResult.passed;
             mergedResult.retried += testResult.retried;
+            mergedResult.flaky += testResult.flaky;
             mergedResult.time += testResult.time;
             if (groupReports) {
                 testResults.push(testResult);
@@ -64984,6 +65121,7 @@ async function run() {
                         failed: actualTestResult.failedCount,
                         passed: actualTestResult.passedCount,
                         retried: actualTestResult.retriedCount,
+                        flaky: actualTestResult.flakyCount,
                         time: actualTestResult.time,
                         foundFiles: 1,
                         globalAnnotations: actualTestResult.annotations,
@@ -64997,6 +65135,7 @@ async function run() {
         setOutput('skipped', mergedResult.skipped);
         setOutput('failed', mergedResult.failed);
         setOutput('retried', mergedResult.retried);
+        setOutput('flaky', mergedResult.flaky);
         setOutput('time', mergedResult.time);
         if (!(mergedResult.totalCount > 0 || mergedResult.skipped > 0) && requireTests) {
             setFailed(`❌ No test results found for ${checkName}`);

@@ -29,7 +29,8 @@ export async function annotateTestResult(
 
   let title = 'No test results found!'
   if (foundResults) {
-    title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed.`
+    const flakyTitle = testResult.flaky > 0 ? `, ${testResult.flaky} flaky` : ''
+    title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed${flakyTitle}.`
   }
 
   core.info(`ℹ️ - ${testResult.checkName} - ${title}`)
