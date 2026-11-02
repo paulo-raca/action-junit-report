@@ -1936,6 +1936,7 @@ describe('flaky failure reporting (annotate_flaky)', () => {
     expect(result!.retriedCount).toBe(1)
     expect(result!.flakyCount).toBe(0)
     expect(result!.globalAnnotations).toHaveLength(0)
+    expect(result!.time).toBe(0.75) // the latest attempt is the one reported
   })
 
   it('does not call a test that failed every attempt flaky', async () => {
@@ -1943,6 +1944,9 @@ describe('flaky failure reporting (annotate_flaky)', () => {
     expect(result!.flakyCount).toBe(0)
     expect(result!.failedCount).toBe(1)
     expect(result!.globalAnnotations.filter(a => a.annotation_level === 'warning')).toHaveLength(0)
-    expect(result!.globalAnnotations.filter(a => a.status === 'failure')).toHaveLength(1)
+    const failures = result!.globalAnnotations.filter(a => a.status === 'failure')
+    expect(failures).toHaveLength(1)
+    expect(failures[0].message).toBe('third error') // the latest attempt is the one reported
+    expect(failures[0].retries).toBe(2)
   })
 })

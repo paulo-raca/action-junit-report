@@ -64562,21 +64562,22 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
                 // Increment retry count for each additional occurrence
                 const currentRetries = (previous.retries || 0) + 1;
                 retriedCount += 1;
-                if (rank === AttemptRank.Passed || rank > previousRank) {
-                    // Success beats failure beats skip: the latest success is the final result, and a failure replaces a skip
+                if (rank >= previousRank) {
+                    // Success beats failure beats skip, and the latest attempt wins among equals.
+                    // The failed attempts a testcase carries are the ones before it, in order.
                     testcase.retries = currentRetries;
                     testcase.failedAttempts =
-                        previousRank === AttemptRank.Failed ? [previous, ...previous.failedAttempts] : previous.failedAttempts;
+                        previousRank === AttemptRank.Failed ? [...previous.failedAttempts, previous] : previous.failedAttempts;
                     testcaseMap.set(key, testcase);
-                    core_debug(`Retried test, keeping the latest result for: ${key}`);
+                    core_debug(`Retried test, keeping the latest attempt for: ${key}`);
                 }
                 else {
-                    // Keep the previous result, remembering a failure in case the kept result is a success
+                    // A worse attempt than the kept one: keep the previous result, remembering a failure in case it is a success
                     previous.retries = currentRetries;
                     if (rank === AttemptRank.Failed) {
                         previous.failedAttempts.push(testcase);
                     }
-                    core_debug(`Retried test, keeping the previous result for: ${key}`);
+                    core_debug(`Retried test, keeping the better attempt for: ${key}`);
                 }
                 // A success and a failure of the same test make it flaky. Counted once, the first time they meet.
                 // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
