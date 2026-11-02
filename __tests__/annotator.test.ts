@@ -1,7 +1,7 @@
 import {vi, describe, it, expect, beforeEach, afterEach} from 'vitest'
-import {attachComment, buildCommentIdentifier} from '../src/annotator.js'
+import {attachComment, buildCommentIdentifier, buildTitle} from '../src/annotator.js'
 import {buildSummaryTables} from '../src/table.js'
-import {parseTestReports} from '../src/testParser.js'
+import {parseTestReports, TestResult} from '../src/testParser.js'
 
 /**
  *   Copyright 2024 Mike Penz
@@ -283,5 +283,43 @@ describe('buildCommentIdentifier', () => {
     const checkName = ['Test Check']
     const identifier = buildCommentIdentifier(checkName)
     expect(identifier).toBe('<!-- Summary comment for ["Test Check"] by mikepenz/action-junit-report -->')
+  })
+})
+
+describe('buildTitle', () => {
+  const result = (overrides: Partial<TestResult>): TestResult => ({
+    checkName: 'check',
+    summary: '',
+    totalCount: 10,
+    skipped: 1,
+    failed: 1,
+    passed: 8,
+    retried: 0,
+    flaky: 0,
+    time: 0,
+    foundFiles: 1,
+    globalAnnotations: [],
+    testResults: [],
+    ...overrides
+  })
+
+  it('is unchanged when nothing was retried', () => {
+    expect(buildTitle(result({}))).toBe('10 tests run, 8 passed, 1 skipped, 1 failed.')
+  })
+
+  it('mentions flaky tests', () => {
+    expect(buildTitle(result({flaky: 1, retried: 1}))).toBe(
+      '10 tests run, 8 passed, 1 skipped, 1 failed, 1 flaky, 1 retry.'
+    )
+  })
+
+  it('counts flaky tests and retry attempts separately', () => {
+    expect(buildTitle(result({flaky: 1, retried: 3}))).toBe(
+      '10 tests run, 8 passed, 1 skipped, 1 failed, 1 flaky, 3 retries.'
+    )
+  })
+
+  it('mentions retries of a test that kept failing, which is not flaky', () => {
+    expect(buildTitle(result({retried: 2}))).toBe('10 tests run, 8 passed, 1 skipped, 1 failed, 2 retries.')
   })
 })

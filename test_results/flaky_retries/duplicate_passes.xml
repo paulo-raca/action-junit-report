@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="DuplicatePasses" tests="2" failures="0" time="1.0">
+    <!-- The same test reported twice, both times passing: retried, but not flaky -->
+    <testcase classname="test_dup.TestDup" name="test_dup" time="0.25" />
+    <testcase classname="test_dup.TestDup" name="test_dup" time="0.75" />
+</testsuite>

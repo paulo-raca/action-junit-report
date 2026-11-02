@@ -12,6 +12,21 @@ export interface CheckInfo {
   url: string
 }
 
+/**
+ * The one-line summary of a check, e.g. "10 tests run, 8 passed, 1 skipped, 1 failed, 1 flaky, 2 retries."
+ * Flaky tests and retries are only mentioned when there are some (they need check_retries).
+ */
+export function buildTitle(testResult: TestResult): string {
+  let title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed`
+  if (testResult.flaky > 0) {
+    title += `, ${testResult.flaky} flaky`
+  }
+  if (testResult.retried > 0) {
+    title += `, ${testResult.retried} ${testResult.retried === 1 ? 'retry' : 'retries'}`
+  }
+  return `${title}.`
+}
+
 export async function annotateTestResult(
   testResult: TestResult,
   token: string,
@@ -27,10 +42,7 @@ export async function annotateTestResult(
   )
   const foundResults = testResult.totalCount > 0 || testResult.skipped > 0
 
-  let title = 'No test results found!'
-  if (foundResults) {
-    title = `${testResult.totalCount} tests run, ${testResult.passed} passed, ${testResult.skipped} skipped, ${testResult.failed} failed.`
-  }
+  const title = foundResults ? buildTitle(testResult) : 'No test results found!'
 
   core.info(`ℹ️ - ${testResult.checkName} - ${title}`)
 

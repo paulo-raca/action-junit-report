@@ -168,6 +168,10 @@ inputs:
     description: 'Truncate stack traces from test output to 2 lines in annotations'
     required: false
     default: 'true'
+  annotate_flaky:
+    description: 'With check_retries: report each failed attempt of a flaky test (one that passed after retries) as a warning annotation with its failure details, and list the flaky test in the flaky summary. The test still counts as passed.'
+    required: false
+    default: 'false'
   resolve_ignore_classname:
     description: 'Force ignore test case classname from the xml report (This can help fix issues with some tools/languages)'
     required: false
@@ -188,6 +192,10 @@ outputs:
     description: 'The count of all skipped tests'
   failed:
     description: 'The count of all failed tests'
+  retried:
+    description: 'The number of retry attempts: every extra execution of a test that was run more than once (needs check_retries)'
+  flaky:
+    description: 'The number of distinct flaky tests: tests that were retried and passed in the end (needs check_retries)'
   time:
     description: 'The total time taken for all the tests'
   summary:

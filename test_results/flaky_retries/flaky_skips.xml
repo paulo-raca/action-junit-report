@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="FlakySkips" tests="12" time="1.0">
+    <!-- Attempts of the same test: success beats failure beats skip, whatever the order -->
+    <testcase classname="t.T" name="fail_then_skip"><failure message="boom">boom</failure></testcase>
+    <testcase classname="t.T" name="fail_then_skip"><skipped /></testcase>
+
+    <testcase classname="t.T" name="skip_then_fail"><skipped /></testcase>
+    <testcase classname="t.T" name="skip_then_fail"><failure message="boom">boom</failure></testcase>
+
+    <testcase classname="t.T" name="skip_then_pass"><skipped /></testcase>
+    <testcase classname="t.T" name="skip_then_pass" />
+
+    <testcase classname="t.T" name="pass_then_skip" />
+    <testcase classname="t.T" name="pass_then_skip"><skipped /></testcase>
+
+    <testcase classname="t.T" name="skip_then_skip"><skipped /></testcase>
+    <testcase classname="t.T" name="skip_then_skip"><skipped /></testcase>
+
+    <testcase classname="t.T" name="fail_skip_pass"><failure message="first">first</failure></testcase>
+    <testcase classname="t.T" name="fail_skip_pass"><skipped /></testcase>
+    <testcase classname="t.T" name="fail_skip_pass" />
+</testsuite>
