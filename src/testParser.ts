@@ -611,6 +611,7 @@ async function parseTestCases(
     // to prevent accidental duplicate matches across different test classes/files
     const testcaseMap = new Map<string, any>()
     const failedAttemptsByKey = new Map<string, any[]>()
+    const flakyKeys = new Set<string>()
     for (const testcase of testcases) {
       const name = testcase._attributes.name
       const classname = testcase._attributes.classname || ''
@@ -648,24 +649,22 @@ async function parseTestCases(
           retriedCount += 1
           core.debug(`Flaky test: multiple failures for: ${key}`)
         }
+
+        // A success and a failure of the same test make it flaky. Counted once, the first time they meet.
+        // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
+        if (Boolean(failed) !== Boolean(previousFailed) && !flakyKeys.has(key) && !testcaseMap.get(key).skipped) {
+          flakyKeys.add(key)
+          flakyCount++
+        }
+        // The kept (passing) result of a flaky test keeps the failures of its other attempts, so they can be reported.
+        if (annotateFlaky && flakyKeys.has(key)) {
+          testcaseMap.get(key).failedAttempts = failedAttemptsByKey.get(key)
+        }
       } else {
         testcaseMap.set(key, testcase)
       }
     }
-    // A test that ended up passing keeps the failures of its earlier attempts, so they can be reported.
-    for (const [key, testcase] of testcaseMap) {
-      if (annotateFlaky && (testcase.retries || 0) > 0 && !testcase.failure && !testcase.error) {
-        testcase.failedAttempts = failedAttemptsByKey.get(key) || []
-      }
-    }
     testcases = Array.from(testcaseMap.values())
-    // Distinct flaky tests: retried at least once and the kept (final) result is not a failure or a skip.
-    // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
-    for (const testcase of testcases) {
-      if ((testcase.retries || 0) > 0 && !testcase.failure && !testcase.error && !testcase.skipped) {
-        flakyCount++
-      }
-    }
   }
 
   let testCaseFailedCount = 0 // Track number of test cases that failed
@@ -738,7 +737,7 @@ async function parseTestCases(
       attemptAnnotation.retries = 0
       annotations.push(attemptAnnotation)
     }
-    const isFlaky = annotateFlaky && !testFailure && !skip && (testcase.retries || 0) > 0
+    const isFlaky = flakyAttempts.length > 0
 
     // If this isn't reported as a failure and processing all passed tests
     // isn't enabled, then skip the rest of the processing.

@@ -1915,6 +1915,13 @@ describe('flaky failure reporting (annotate_flaky)', () => {
     expect(warnings.map(a => a.message)).toEqual(['later failure', 'later error'])
   })
 
+  it('does not call a test that passed every attempt flaky', async () => {
+    const result = await parse('duplicate_passes.xml', true)
+    expect(result!.retriedCount).toBe(1)
+    expect(result!.flakyCount).toBe(0)
+    expect(result!.globalAnnotations).toHaveLength(0)
+  })
+
   it('does not call a test that failed every attempt flaky', async () => {
     const result = await parse('flaky_all_failures.xml', true)
     expect(result!.flakyCount).toBe(0)
