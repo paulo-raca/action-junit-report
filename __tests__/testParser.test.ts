@@ -1915,6 +1915,22 @@ describe('flaky failure reporting (annotate_flaky)', () => {
     expect(warnings.map(a => a.message)).toEqual(['later failure', 'later error'])
   })
 
+  it('keeps Success > Failure > Skip when a test is retried', async () => {
+    const result = await parse('flaky_skips.xml', true, true)
+    expect(result!.totalCount).toBe(6)
+    expect(result!.failedCount).toBe(2) // fail_then_skip, skip_then_fail: a skip never hides a failure
+    expect(result!.skippedCount).toBe(1) // skip_then_skip, once
+    expect(result!.passedCount).toBe(3) // skip_then_pass, pass_then_skip, fail_skip_pass
+    expect(result!.retriedCount).toBe(7) // every extra attempt
+    expect(result!.flakyCount).toBe(1) // only fail_skip_pass has both a failure and a success
+
+    const failures = result!.globalAnnotations.filter(a => a.annotation_level === 'failure')
+    expect(failures.map(a => a.title).sort()).toEqual(['T.fail_then_skip', 'T.skip_then_fail'])
+    const warnings = result!.globalAnnotations.filter(a => a.annotation_level === 'warning')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].message).toBe('first')
+  })
+
   it('does not call a test that passed every attempt flaky', async () => {
     const result = await parse('duplicate_passes.xml', true)
     expect(result!.retriedCount).toBe(1)

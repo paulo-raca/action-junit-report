@@ -64516,6 +64516,21 @@ async function createTestCaseAnnotation(testcase, issue, failureIndex, totalFail
         time: testTime
     };
 }
+function isSkipped(testcase) {
+    return Boolean(testcase.skipped || testcase._attributes.status === 'disabled' || testcase._attributes.status === 'ignored');
+}
+/** How good an attempt of a retried test is, when picking the one to report: Success > Failure > Skip. */
+var AttemptRank;
+(function (AttemptRank) {
+    AttemptRank[AttemptRank["Skipped"] = 0] = "Skipped";
+    AttemptRank[AttemptRank["Failed"] = 1] = "Failed";
+    AttemptRank[AttemptRank["Passed"] = 2] = "Passed";
+})(AttemptRank || (AttemptRank = {}));
+function attemptRank(testcase) {
+    if (isSkipped(testcase))
+        return AttemptRank.Skipped;
+    return testcase.failure || testcase.error ? AttemptRank.Failed : AttemptRank.Passed;
+}
 async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testcases, includePassed = false, annotateNotice = false, checkRetries = false, excludeSources, checkTitleTemplate = undefined, testFilesPrefix = '', transformer, followSymlink, truncateStackTraces, limit = -1, resolveIgnoreClassname = false, annotateFlaky = false) {
     const toIssueArray = (value) => {
         if (!value)
@@ -64540,38 +64555,33 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
             const file = testcase._attributes.file || '';
             const key = `${name}|${classname}|${file}`;
             if (testcaseMap.get(key) !== undefined) {
-                // testcase with matching key exists - this is a flaky test
-                const failed = testcase.failure || testcase.error;
+                // testcase with matching key exists - this test was retried
                 const previous = testcaseMap.get(key);
-                const previousFailed = previous.failure || previous.error;
+                const rank = attemptRank(testcase);
+                const previousRank = attemptRank(previous);
                 // Increment retry count for each additional occurrence
                 const currentRetries = (previous.retries || 0) + 1;
-                if (!failed) {
-                    // Current execution is successful - use this as the final result
-                    // The test is flaky but ultimately passed
+                retriedCount += 1;
+                if (rank === AttemptRank.Passed || rank > previousRank) {
+                    // Success beats failure beats skip: the latest success is the final result, and a failure replaces a skip
                     testcase.retries = currentRetries;
-                    testcase.failedAttempts = previousFailed ? [previous, ...previous.failedAttempts] : previous.failedAttempts;
+                    testcase.failedAttempts =
+                        previousRank === AttemptRank.Failed ? [previous, ...previous.failedAttempts] : previous.failedAttempts;
                     testcaseMap.set(key, testcase);
-                    retriedCount += 1;
-                    core_debug(`Flaky test succeeded after retry for: ${key}`);
-                }
-                else if (!previousFailed) {
-                    // Previous was successful, current failed - keep the successful one
-                    previous.retries = currentRetries;
-                    previous.failedAttempts.push(testcase);
-                    retriedCount += 1;
-                    core_debug(`Flaky test: keeping success, dropping failure for: ${key}`);
+                    core_debug(`Retried test, keeping the latest result for: ${key}`);
                 }
                 else {
-                    // Both failed - keep tracking retries but keep the previous
+                    // Keep the previous result, remembering a failure in case the kept result is a success
                     previous.retries = currentRetries;
-                    previous.failedAttempts.push(testcase);
-                    retriedCount += 1;
-                    core_debug(`Flaky test: multiple failures for: ${key}`);
+                    if (rank === AttemptRank.Failed) {
+                        previous.failedAttempts.push(testcase);
+                    }
+                    core_debug(`Retried test, keeping the previous result for: ${key}`);
                 }
                 // A success and a failure of the same test make it flaky. Counted once, the first time they meet.
                 // retriedCount above counts every extra attempt, so a test retried twice adds 2 there but only 1 here.
-                if (Boolean(failed) !== Boolean(previousFailed) && !flakyKeys.has(key) && !testcaseMap.get(key).skipped) {
+                const kept = testcaseMap.get(key);
+                if (attemptRank(kept) === AttemptRank.Passed && kept.failedAttempts.length > 0 && !flakyKeys.has(key)) {
                     flakyKeys.add(key);
                     flakyCount++;
                 }
@@ -64594,7 +64604,7 @@ async function parseTestCases(suiteName, suiteFile, suiteLine, breadCrumb, testc
         const errorIssues = toIssueArray(testcase.error);
         const issues = [...failureIssues, ...errorIssues];
         const testFailure = issues.length > 0; // test failed
-        const skip = testcase.skipped || testcase._attributes.status === 'disabled' || testcase._attributes.status === 'ignored';
+        const skip = isSkipped(testcase);
         const failed = testFailure && !skip; // test failure, but was skipped -> don't fail if a ignored test failed
         const success = !testFailure; // not a failure -> thus a success
         const annotationLevel = success || skip ? 'notice' : 'failure'; // a skipped test shall not fail the run
