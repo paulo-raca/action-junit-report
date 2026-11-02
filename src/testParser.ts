@@ -610,17 +610,12 @@ async function parseTestCases(
     // Use a compound key including name, classname (if available), and file (if available)
     // to prevent accidental duplicate matches across different test classes/files
     const testcaseMap = new Map<string, any>()
-    const failedAttemptsByKey = new Map<string, any[]>()
     const flakyKeys = new Set<string>()
     for (const testcase of testcases) {
       const name = testcase._attributes.name
       const classname = testcase._attributes.classname || ''
       const file = testcase._attributes.file || ''
       const key = `${name}|${classname}|${file}`
-
-      if (testcase.failure || testcase.error) {
-        failedAttemptsByKey.set(key, [...(failedAttemptsByKey.get(key) || []), testcase])
-      }
 
       if (testcaseMap.get(key) !== undefined) {
         // testcase with matching key exists - this is a flaky test
@@ -635,17 +630,20 @@ async function parseTestCases(
           // Current execution is successful - use this as the final result
           // The test is flaky but ultimately passed
           testcase.retries = currentRetries
+          testcase.failedAttempts = previousFailed ? [previous, ...previous.failedAttempts] : previous.failedAttempts
           testcaseMap.set(key, testcase)
           retriedCount += 1
           core.debug(`Flaky test succeeded after retry for: ${key}`)
         } else if (!previousFailed) {
           // Previous was successful, current failed - keep the successful one
           previous.retries = currentRetries
+          previous.failedAttempts.push(testcase)
           retriedCount += 1
           core.debug(`Flaky test: keeping success, dropping failure for: ${key}`)
         } else {
           // Both failed - keep tracking retries but keep the previous
           previous.retries = currentRetries
+          previous.failedAttempts.push(testcase)
           retriedCount += 1
           core.debug(`Flaky test: multiple failures for: ${key}`)
         }
@@ -656,11 +654,9 @@ async function parseTestCases(
           flakyKeys.add(key)
           flakyCount++
         }
-        // The kept (passing) result of a flaky test keeps the failures of its other attempts, so they can be reported.
-        if (annotateFlaky && flakyKeys.has(key)) {
-          testcaseMap.get(key).failedAttempts = failedAttemptsByKey.get(key)
-        }
       } else {
+        // Every kept testcase carries the failed attempts that are not itself: a passing one reports them as flaky.
+        testcase.failedAttempts = []
         testcaseMap.set(key, testcase)
       }
     }
@@ -704,7 +700,7 @@ async function parseTestCases(
 
     // A flaky test (failed, then passed on retry): report each failed attempt as a warning with its failure
     // details, so the report shows what failed even though the test counts as passed.
-    const flakyAttempts: any[] = !testFailure && !skip ? testcase.failedAttempts || [] : []
+    const flakyAttempts: any[] = annotateFlaky && !testFailure && !skip ? testcase.failedAttempts || [] : []
     for (let attemptIndex = 0; attemptIndex < flakyAttempts.length; attemptIndex++) {
       const attempt = flakyAttempts[attemptIndex]
       const attemptIssues = [...toIssueArray(attempt.failure), ...toIssueArray(attempt.error)]
